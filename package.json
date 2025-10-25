@@ -2,10 +2,21 @@
   "name": "characterai-openai-proxy",
   "version": "1.0.0",
   "description": "OpenAI-compatible API proxy for Character.AI with conversation persistence",
+  "main": "api/chat.js",
   "type": "module",
   "scripts": {
+    "dev": "vercel dev",
     "test": "node test.js"
   },
+  "keywords": [
+    "character.ai",
+    "openai",
+    "proxy",
+    "api",
+    "vercel"
+  ],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
     "cainode": "^1.2.2",
     "node-fetch": "^3.3.2"
