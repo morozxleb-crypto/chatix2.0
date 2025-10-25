@@ -1,19 +1,10 @@
 {
   "version": 2,
-  "rewrites": [
-    {
-      "source": "/v1/chat/completions",
-      "destination": "/api/chat"
-    },
-    {
-      "source": "/health",
-      "destination": "/api/health"
-    }
+  "builds": [
+    { "src": "api/*.js", "use": "@vercel/node" }
   ],
-  "functions": {
-    "api/**/*.js": {
-      "memory": 1024,
-      "maxDuration": 30
-    }
-  }
+  "routes": [
+    { "src": "/v1/chat/completions", "dest": "/api/chat.js" },
+    { "src": "/health", "dest": "/api/health.js" }
+  ]
 }
