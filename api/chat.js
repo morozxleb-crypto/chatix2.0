@@ -29,10 +29,31 @@ function convertToOpenAIFormat(text, characterName = 'Assistant') {
   };
 }
 
+// helper: гарантированно получаем JSON тело независимо от того,
+// запарсил ли его Vercel заранее или нет.
+async function getRequestJson(req) {
+  if (req.body) {
+    return typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+  }
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => (body += chunk.toString()));
+    req.on('end', () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (e) {
+        // если не JSON, вернём строку
+        resolve(body);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
 async function handleChatCompletion(req, res) {
   try {
-    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
-    
+    const body = await getRequestJson(req);
+
     const {
       model: characterId,
       messages,
@@ -73,7 +94,7 @@ async function handleChatCompletion(req, res) {
     }
 
     const client = new CharacterAI(token);
-    
+
     const conversationId = generateConversationId(characterId);
     let conversation = storage.loadConversation(conversationId);
     let historyId = conversation?.historyId || null;
@@ -83,7 +104,7 @@ async function handleChatCompletion(req, res) {
       try {
         const characterInfo = await client.getCharacterInfo(characterId);
         characterName = characterInfo.name || characterId;
-        
+
         conversation = {
           conversationId,
           characterId,
@@ -93,7 +114,7 @@ async function handleChatCompletion(req, res) {
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString()
         };
-        
+
         storage.saveConversation(conversationId, conversation);
       } catch (error) {
         return res.status(500).json({
@@ -110,7 +131,7 @@ async function handleChatCompletion(req, res) {
     }
 
     const lastMessage = messages[messages.length - 1];
-    if (lastMessage.role !== 'user') {
+    if (!lastMessage || lastMessage.role !== 'user') {
       return res.status(400).json({
         error: {
           message: 'Last message must be from user',
@@ -149,6 +170,7 @@ async function handleChatCompletion(req, res) {
       storage.saveConversation(conversationId, conversation);
 
       if (stream) {
+        // SSE-like simple streaming
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
@@ -187,7 +209,7 @@ async function handleChatCompletion(req, res) {
         res.end();
       } else {
         const openAIResponse = convertToOpenAIFormat(response.text, characterName);
-        res.status(200).json(openAIResponse);
+        return res.status(200).json(openAIResponse);
       }
     } catch (error) {
       return res.status(500).json({
