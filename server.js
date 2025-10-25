@@ -22,10 +22,26 @@ async function parseBody(req) {
   });
 }
 
+function enhanceResponse(res) {
+  res.status = function(code) {
+    res.statusCode = code;
+    return this;
+  };
+  
+  res.json = function(data) {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify(data));
+    return this;
+  };
+  
+  return res;
+}
+
 const server = http.createServer(async (req, res) => {
   const parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
   const pathname = parsedUrl.pathname;
 
+  enhanceResponse(res);
   req.body = await parseBody(req);
 
   if (pathname === '/v1/chat/completions') {

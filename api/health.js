@@ -30,6 +30,8 @@ export default async function handler(req, res) {
       characterAIStatus = isHealthy ? 'connected' : 'connection_failed';
     }
 
+    const storageInfo = storage.getStorageInfo();
+    
     return res.status(200).json({
       status: 'ok',
       service: 'Character.AI OpenAI Proxy',
@@ -37,7 +39,7 @@ export default async function handler(req, res) {
       timestamp: new Date().toISOString(),
       characterai_status: characterAIStatus,
       storage: {
-        type: 'local_json',
+        ...storageInfo,
         conversations_count: conversations.length
       },
       endpoints: {

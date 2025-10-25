@@ -79,18 +79,16 @@ async function handleChatCompletion(req, res) {
     let historyId = conversation?.historyId || null;
     let characterName = conversation?.characterName || characterId;
 
-    if (!historyId) {
+    if (!conversation) {
       try {
         const characterInfo = await client.getCharacterInfo(characterId);
         characterName = characterInfo.name || characterId;
-        
-        historyId = await client.createChat(characterId);
         
         conversation = {
           conversationId,
           characterId,
           characterName,
-          historyId,
+          historyId: null,
           messages: [],
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString()
@@ -100,12 +98,15 @@ async function handleChatCompletion(req, res) {
       } catch (error) {
         return res.status(500).json({
           error: {
-            message: `Failed to initialize chat: ${error.message}`,
+            message: `Failed to initialize conversation: ${error.message}`,
             type: 'character_ai_error',
             code: 'initialization_failed'
           }
         });
       }
+    } else {
+      historyId = conversation.historyId;
+      characterName = conversation.characterName;
     }
 
     const lastMessage = messages[messages.length - 1];
@@ -124,9 +125,13 @@ async function handleChatCompletion(req, res) {
     try {
       const response = await client.sendMessage(
         characterId,
-        historyId,
-        userMessage
+        userMessage,
+        historyId
       );
+
+      if (response.historyId && !conversation.historyId) {
+        conversation.historyId = response.historyId;
+      }
 
       conversation.messages.push({
         role: 'user',
@@ -137,8 +142,7 @@ async function handleChatCompletion(req, res) {
       conversation.messages.push({
         role: 'assistant',
         content: response.text,
-        timestamp: new Date().toISOString(),
-        turn: response.turn
+        timestamp: new Date().toISOString()
       });
 
       conversation.updatedAt = new Date().toISOString();

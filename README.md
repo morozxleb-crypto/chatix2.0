@@ -128,9 +128,14 @@ console.log(data.choices[0].message.content);
 
 ## Conversation Persistence
 
-Conversations are automatically saved to local JSON files in the `conversations/` directory. Each conversation is identified by a combination of user ID and character ID.
+Conversations are automatically saved to JSON files for persistence:
 
-When you send a new message to the same character, the conversation will continue from where it left off, including any existing dialogue from the Character.AI website.
+- **Local Development**: Stored in `conversations/` directory in your project
+- **Vercel Deployment**: Stored in `/tmp` directory (ephemeral, resets between deployments)
+
+Each conversation is identified by a combination of user ID and character ID. When you send a new message to the same character, the conversation will continue from where it left off.
+
+**Note**: On Vercel, conversations persist only within the same serverless function instance. For permanent persistence on Vercel, consider integrating a database solution like Vercel KV, Supabase, or MongoDB.
 
 ## Health Check
 
@@ -193,6 +198,24 @@ This will test:
 For production deployment, you can set these optional environment variables:
 
 - `PORT`: Server port (default: 5000)
+- `VERCEL`: Automatically set by Vercel (used to detect deployment environment)
+- `VERCEL_ENV`: Automatically set by Vercel to `production`, `preview`, or `development`
+
+## Storage Behavior
+
+The proxy automatically detects its environment and adjusts storage accordingly:
+
+| Environment | Storage Location | Persistence |
+|-------------|-----------------|-------------|
+| Local Dev | `./conversations/` | Permanent |
+| Vercel | `/tmp/conversations/` | Ephemeral (per instance) |
+
+**Vercel Note**: Conversations stored in `/tmp` are ephemeral and will reset when:
+- Your deployment updates
+- The serverless function scales down and back up
+- Vercel rotates instances
+
+For production use on Vercel, we recommend adding a persistent storage layer (KV, database, etc.).
 
 ## API Endpoints
 
