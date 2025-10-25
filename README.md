@@ -30,7 +30,7 @@ npm run dev
 
 ### Vercel Deployment
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/morozxleb-crypto/chatix2.0)
 
 1. Click the "Deploy with Vercel" button above
 2. Configure your project settings
