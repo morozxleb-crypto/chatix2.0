@@ -29,22 +29,14 @@ function convertToOpenAIFormat(text, characterName = 'Assistant') {
   };
 }
 
-// helper: гарантированно получаем JSON тело независимо от того,
-// запарсил ли его Vercel заранее или нет.
 async function getRequestJson(req) {
-  if (req.body) {
-    return typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
-  }
+  if (req.body) return typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
   return new Promise((resolve, reject) => {
     let body = '';
     req.on('data', chunk => (body += chunk.toString()));
     req.on('end', () => {
-      try {
-        resolve(body ? JSON.parse(body) : {});
-      } catch (e) {
-        // если не JSON, вернём строку
-        resolve(body);
-      }
+      try { resolve(body ? JSON.parse(body) : {}); }
+      catch (e) { resolve(body); }
     });
     req.on('error', reject);
   });
@@ -53,48 +45,17 @@ async function getRequestJson(req) {
 async function handleChatCompletion(req, res) {
   try {
     const body = await getRequestJson(req);
-
-    const {
-      model: characterId,
-      messages,
-      stream = false
-    } = body;
+    const { model: characterId, messages, stream = false, regen = false } = body;
 
     const authHeader = req.headers.authorization || req.headers.Authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({
-        error: {
-          message: 'Missing or invalid authorization header. Use: Authorization: Bearer YOUR_CHARACTER_AI_TOKEN',
-          type: 'invalid_request_error',
-          code: 'invalid_api_key'
-        }
-      });
+      return res.status(401).json({ error: { message: 'Missing or invalid authorization header', type: 'invalid_request_error', code: 'invalid_api_key' } });
     }
-
     const token = authHeader.replace('Bearer ', '');
-
-    if (!characterId) {
-      return res.status(400).json({
-        error: {
-          message: 'Missing model parameter. Use character ID as model.',
-          type: 'invalid_request_error',
-          code: 'invalid_model'
-        }
-      });
-    }
-
-    if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({
-        error: {
-          message: 'Messages array is required and must not be empty',
-          type: 'invalid_request_error',
-          code: 'invalid_messages'
-        }
-      });
-    }
+    if (!characterId) return res.status(400).json({ error: { message: 'Missing model parameter', type: 'invalid_request_error', code: 'invalid_model' } });
+    if (!messages || !Array.isArray(messages) || messages.length === 0) return res.status(400).json({ error: { message: 'Messages array is required', type: 'invalid_request_error', code: 'invalid_messages' } });
 
     const client = new CharacterAI(token);
-
     const conversationId = generateConversationId(characterId);
     let conversation = storage.loadConversation(conversationId);
     let historyId = conversation?.historyId || null;
@@ -117,13 +78,7 @@ async function handleChatCompletion(req, res) {
 
         storage.saveConversation(conversationId, conversation);
       } catch (error) {
-        return res.status(500).json({
-          error: {
-            message: `Failed to initialize conversation: ${error.message}`,
-            type: 'character_ai_error',
-            code: 'initialization_failed'
-          }
-        });
+        return res.status(500).json({ error: { message: `Failed to initialize conversation: ${error.message}`, type: 'character_ai_error', code: 'initialization_failed' } });
       }
     } else {
       historyId = conversation.historyId;
@@ -132,34 +87,37 @@ async function handleChatCompletion(req, res) {
 
     const lastMessage = messages[messages.length - 1];
     if (!lastMessage || lastMessage.role !== 'user') {
-      return res.status(400).json({
-        error: {
-          message: 'Last message must be from user',
-          type: 'invalid_request_error',
-          code: 'invalid_last_message'
-        }
-      });
+      return res.status(400).json({ error: { message: 'Last message must be from user', type: 'invalid_request_error', code: 'invalid_last_message' } });
     }
 
     const userMessage = lastMessage.content;
 
-    try {
-      const response = await client.sendMessage(
-        characterId,
-        userMessage,
-        historyId
-      );
+    // Если regen, удаляем последний assistant-ответ
+    if (regen && conversation.messages.length > 0) {
+      for (let i = conversation.messages.length - 1; i >= 0; i--) {
+        if (conversation.messages[i].role === 'assistant') {
+          conversation.messages.splice(i, 1);
+          break;
+        }
+      }
+    }
 
+    try {
+      const response = await client.sendMessage(characterId, userMessage, historyId);
+
+      // Сохраняем historyId только если его нет
       if (response.historyId && !conversation.historyId) {
         conversation.historyId = response.historyId;
       }
 
+      // Добавляем user-сообщение
       conversation.messages.push({
         role: 'user',
         content: userMessage,
         timestamp: new Date().toISOString()
       });
 
+      // Добавляем assistant-сообщение
       conversation.messages.push({
         role: 'assistant',
         content: response.text,
@@ -170,7 +128,6 @@ async function handleChatCompletion(req, res) {
       storage.saveConversation(conversationId, conversation);
 
       if (stream) {
-        // SSE-like simple streaming
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
@@ -212,23 +169,11 @@ async function handleChatCompletion(req, res) {
         return res.status(200).json(openAIResponse);
       }
     } catch (error) {
-      return res.status(500).json({
-        error: {
-          message: `Character.AI API error: ${error.message}`,
-          type: 'character_ai_error',
-          code: 'api_error'
-        }
-      });
+      return res.status(500).json({ error: { message: `Character.AI API error: ${error.message}`, type: 'character_ai_error', code: 'api_error' } });
     }
   } catch (error) {
     console.error('Chat completion error:', error);
-    return res.status(500).json({
-      error: {
-        message: error.message || 'Internal server error',
-        type: 'internal_error',
-        code: 'server_error'
-      }
-    });
+    return res.status(500).json({ error: { message: error.message || 'Internal server error', type: 'internal_error', code: 'server_error' } });
   }
 }
 
@@ -237,19 +182,8 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
-  if (req.method !== 'POST') {
-    return res.status(405).json({
-      error: {
-        message: 'Method not allowed. Use POST.',
-        type: 'invalid_request_error',
-        code: 'method_not_allowed'
-      }
-    });
-  }
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: { message: 'Method not allowed. Use POST.', type: 'invalid_request_error', code: 'method_not_allowed' } });
 
   return handleChatCompletion(req, res);
 }
