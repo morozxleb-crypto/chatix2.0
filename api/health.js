@@ -31,7 +31,7 @@ export default async function handler(req, res) {
     }
 
     const storageInfo = storage.getStorageInfo();
-    
+
     return res.status(200).json({
       status: 'ok',
       service: 'Character.AI OpenAI Proxy',
@@ -44,7 +44,7 @@ export default async function handler(req, res) {
       },
       endpoints: {
         chat: '/v1/chat/completions',
-        health: '/api/health'
+        health: '/health'
       }
     });
   } catch (error) {
