@@ -11,18 +11,6 @@ function genId() {
   return `${Date.now()}_${Math.random().toString(36).slice(2,9)}`;
 }
 
-function ensureMessageIds(conversation) {
-  let changed = false;
-  conversation.messages = conversation.messages.map(m => {
-    if (!m.id) {
-      changed = true;
-      return { ...m, id: genId() };
-    }
-    return m;
-  });
-  return changed;
-}
-
 function convertToOpenAIFormat(text, characterName = 'Assistant') {
   return {
     id: `chatcmpl-${Date.now()}`,
@@ -54,6 +42,13 @@ async function getRequestJson(req) {
   });
 }
 
+function ensureMessageIds(conversation) {
+  conversation.messages = conversation.messages.map(m => {
+    if (!m.id) m.id = genId();
+    return m;
+  });
+}
+
 function findMessageIndex(messages, { id, time, index }) {
   if (typeof index === 'number' && index >= 0 && index < messages.length) return index;
   if (id) {
@@ -67,29 +62,44 @@ function findMessageIndex(messages, { id, time, index }) {
   return -1;
 }
 
-// Отправить один user-сообщение в Character.AI и получить assistant ответ,
-// также вернуть historyId (если есть) для последующих запросов.
-async function sendOne(client, characterId, userText, historyId) {
+// Отправка одного user-сообщения, возвращает { assistantText, historyId, turn }
+async function sendOne(client, characterId, userText, historyId = null) {
   const resp = await client.sendMessage(characterId, userText, historyId);
-  // resp.historyId — ожидаем, что cainode возвращает идентификатор истории
-  return {
-    assistantText: resp.text || '',
-    historyId: resp.historyId || resp.turn?.turn_key?.turn_id || null
-  };
+  const turn = resp.turn || resp;
+  const text =
+    (turn?.candidates && (turn.candidates[0]?.raw_content || turn.candidates[0]?.content)) ||
+    resp?.text ||
+    '';
+  const history = turn?.turn_key?.turn_id || resp?.historyId || null;
+  return { assistantText: text, historyId: history, turn: turn || resp };
 }
 
-// Частичный rebuild: из исходной истории (originalMessages) начиная с позиции startUserIndex
-// отправляем в Character.AI последовательно все user сообщения, получая ассистентские ответы.
-// startHistoryId — historyId предыдущей ассистентской записи (или null).
-async function partialRebuild(client, characterId, baseConversation, originalMessages, startUserIndex, startHistoryId) {
-  // baseConversation — объект, который мы будем дополнять (с сохранёнными сообщениями до startUserIndex)
-  let historyId = startHistoryId;
-  // пройдём по originalMessages от startUserIndex до конца, но берем только user сообщения:
+// попытка удалить ассистентские turn'ы серверно, игнорируем ошибки (логируем)
+async function tryDeleteAssistantTurns(client, conversation, startIdx) {
+  for (let i = startIdx; i < conversation.messages.length; i++) {
+    const m = conversation.messages[i];
+    if (m.role === 'assistant' && m.turnId) {
+      try {
+        await client.deleteMessage(m.turnId);
+      } catch (err) {
+        // не фатально — просто логируем
+        console.warn('deleteMessage failed for', m.turnId, err?.message || err);
+      }
+    }
+  }
+}
+
+// partial rebuild: отправляем в Character.AI все user-сообщения из originalMessages, начиная с startUserIndex,
+// используя базовый historyId (history from previous assistant).
+async function partialRebuild(client, characterId, baseConversation, originalMessages, startUserIndex, baseHistoryId) {
+  let historyId = baseHistoryId || baseConversation.historyId || null;
+
+  // ensure baseConversation.messages already contains messages up to startUserIndex-1
   for (let i = startUserIndex; i < originalMessages.length; i++) {
     const m = originalMessages[i];
     if (m.role !== 'user') continue;
 
-    // отправляем user
+    // add user locally
     const userEntry = {
       id: m.id || genId(),
       role: 'user',
@@ -100,21 +110,22 @@ async function partialRebuild(client, characterId, baseConversation, originalMes
 
     const resp = await sendOne(client, characterId, userEntry.content, historyId);
 
-    // добавляем assistant сообщение, сохраняем historyId в нём
+    // store assistant entry with turnId/candidate if available
     const assistantEntry = {
       id: genId(),
       role: 'assistant',
-      content: resp.assistantText,
+      content: resp.assistantText || '',
       time: Date.now(),
-      historyId: resp.historyId
+      turnId: resp.turn?.turn_key?.turn_id || resp.historyId || null,
+      // candidate id fallback (some cainode versions)
+      candidateId: resp.turn?.candidates?.[0]?.candidate_id || resp.turn?.candidates?.[0]?.id || null
     };
-    baseConversation.messages.push(assistantEntry);
 
-    // обновляем historyId для следующего шага
-    if (resp.historyId) historyId = resp.historyId;
+    if (assistantEntry.turnId) historyId = assistantEntry.turnId;
+    baseConversation.messages.push(assistantEntry);
   }
 
-  baseConversation.historyId = historyId || baseConversation.historyId || null;
+  baseConversation.historyId = baseConversation.historyId || historyId;
   baseConversation.updatedAt = new Date().toISOString();
   storage.saveConversation(baseConversation.conversationId, baseConversation);
   return baseConversation;
@@ -128,8 +139,8 @@ async function handleChatCompletion(req, res) {
       messages,
       stream = false,
       operation = 'send', // send | edit | delete | regen
-      target = null,      // для edit/delete/regеn: { id, time, index }
-      newContent = null   // для edit
+      target = null,      // { id, time, index }
+      newContent = null   // for edit
     } = body;
 
     const authHeader = req.headers.authorization || req.headers.Authorization;
@@ -145,11 +156,8 @@ async function handleChatCompletion(req, res) {
     let characterName = characterId;
 
     if (!conversation) {
-      // создаём пустой
-      try {
-        const info = await client.getCharacterInfo(characterId).catch(()=>({name:characterId}));
-        characterName = info.name || characterId;
-      } catch(e){}
+      const info = await client.getCharacterInfo(characterId).catch(()=>({name:characterId}));
+      characterName = info.name || characterId;
       conversation = {
         conversationId,
         characterId,
@@ -163,10 +171,10 @@ async function handleChatCompletion(req, res) {
       characterName = conversation.characterName || characterId;
     }
 
-    // гарантируем id у уже существующих сообщений
+    // гарантируем id у сообщений
     ensureMessageIds(conversation);
 
-    // Common validation for send operation: messages array with last user
+    // ---- SEND (обычная отправка) ----
     if (operation === 'send') {
       if (!messages || !Array.isArray(messages) || messages.length === 0) {
         return res.status(400).json({ error: { message: 'Messages array is required', type: 'invalid_request_error', code: 'invalid_messages' } });
@@ -176,25 +184,23 @@ async function handleChatCompletion(req, res) {
         return res.status(400).json({ error: { message: 'Last message must be user', type: 'invalid_request_error', code: 'invalid_last_message' } });
       }
 
-      // пушим в Character.AI, используя текущ conversation.historyId как база (если есть)
       const userText = last.content;
-      // добавляем user локально
       const userEntry = { id: last.id || genId(), role: 'user', content: userText, time: last.time || Date.now() };
       conversation.messages.push(userEntry);
 
+      // отправляем, используя conversation.historyId если есть
       const resp = await client.sendMessage(characterId, userText, conversation.historyId);
 
       const assistantEntry = {
         id: genId(),
         role: 'assistant',
-        content: resp.text || '',
+        content: resp.text || (resp.turn && (resp.turn.candidates?.[0]?.raw_content || resp.turn.candidates?.[0]?.content)) || '',
         time: Date.now(),
-        historyId: resp.historyId || resp.turn?.turn_key?.turn_id || null
+        turnId: resp.turn?.turn_key?.turn_id || resp.historyId || null,
+        candidateId: resp.turn?.candidates?.[0]?.candidate_id || resp.turn?.candidates?.[0]?.id || null
       };
 
-      // сохраняем historyId если нет
-      if (assistantEntry.historyId && !conversation.historyId) conversation.historyId = assistantEntry.historyId;
-
+      if (assistantEntry.turnId && !conversation.historyId) conversation.historyId = assistantEntry.turnId;
       conversation.messages.push(assistantEntry);
       conversation.updatedAt = new Date().toISOString();
       storage.saveConversation(conversation.conversationId, conversation);
@@ -210,87 +216,117 @@ async function handleChatCompletion(req, res) {
       } else {
         return res.status(200).json(convertToOpenAIFormat(assistantEntry.content, conversation.characterName));
       }
-    } else if (operation === 'regen') {
-      // regen last user (or target)
-      // определим индекс user
+    }
+
+    // ---- REGEN ----
+    if (operation === 'regen') {
+      // определяем target user (если есть) или последний user
       let targetIdx = -1;
       if (target) targetIdx = findMessageIndex(conversation.messages, target);
       else {
-        for (let i = conversation.messages.length -1; i>=0; i--) {
-          if (conversation.messages[i].role === 'user') { targetIdx = i; break; }
-        }
+        for (let i = conversation.messages.length -1; i>=0; i--) if (conversation.messages[i].role === 'user') { targetIdx = i; break; }
       }
       if (targetIdx === -1) return res.status(400).json({ error: 'No user message to regen' });
 
-      // найдем пред. ассистента перед этим user (для historyId)
-      let prevAssistantIdx = -1;
-      for (let i = targetIdx -1; i >=0; i--) {
-        if (conversation.messages[i].role === 'assistant') { prevAssistantIdx = i; break; }
+      // ассистент после target
+      const assistantIdx = (targetIdx + 1 < conversation.messages.length && conversation.messages[targetIdx+1].role === 'assistant') ? targetIdx+1 : -1;
+
+      // если есть turnId у assistant, попробуем regenerateTurn(turnId)
+      if (assistantIdx !== -1 && conversation.messages[assistantIdx].turnId) {
+        try {
+          const turnId = conversation.messages[assistantIdx].turnId;
+          const regenResp = await client.regenerateTurn(turnId);
+          // извлечём текст из regenResp (fallbacks)
+          const newText = regenResp?.turn?.candidates?.[0]?.raw_content || regenResp?.text || regenResp?.candidates?.[0]?.raw_content || null;
+          if (newText) {
+            conversation.messages[assistantIdx].content = newText;
+            conversation.messages[assistantIdx].time = Date.now();
+            storage.saveConversation(conversation.conversationId, conversation);
+            return res.status(200).json({ status: 'ok', conversation });
+          }
+        } catch (err) {
+          console.warn('regenerateTurn failed, fallback to sendOne', err?.message || err);
+        }
       }
-      const baseHistoryId = prevAssistantIdx !== -1 ? conversation.messages[prevAssistantIdx].historyId || conversation.historyId : conversation.historyId;
 
-      // обрежем локальную историю до targetIdx (включая user)
-      const original = conversation.messages.slice(); // copy
-      conversation.messages = conversation.messages.slice(0, targetIdx + 1);
+      // fallback: удаляем старого ассистента локально и просто отправляем user снова (используя historyId from previous assistant if exists)
+      // ищем предыдущ assistant before targetIdx
+      let prevAssistantIdx = -1;
+      for (let i = targetIdx-1; i>=0; i--) if (conversation.messages[i].role === 'assistant') { prevAssistantIdx = i; break; }
+      const baseHistoryId = prevAssistantIdx !== -1 ? (conversation.messages[prevAssistantIdx].turnId || conversation.historyId) : conversation.historyId;
 
-      // теперь отправим только тот user (targetIdx) и получим новый assistant ответ
+      // обрезаем до targetIdx (включая user)
+      conversation.messages = conversation.messages.slice(0, targetIdx+1);
+
       const user = conversation.messages[conversation.messages.length -1];
-      const res1 = await sendOne(client, characterId, user.content, baseHistoryId);
+      const resp1 = await sendOne(client, characterId, user.content, baseHistoryId);
 
       const assistantEntry = {
         id: genId(),
         role: 'assistant',
-        content: res1.assistantText,
+        content: resp1.assistantText || '',
         time: Date.now(),
-        historyId: res1.historyId
+        turnId: resp1.turn?.turn_key?.turn_id || resp1.historyId || null,
+        candidateId: resp1.turn?.candidates?.[0]?.candidate_id || resp1.turn?.candidates?.[0]?.id || null
       };
-      if (assistantEntry.historyId) conversation.historyId = assistantEntry.historyId;
+      if (assistantEntry.turnId && !conversation.historyId) conversation.historyId = assistantEntry.turnId;
       conversation.messages.push(assistantEntry);
-
       conversation.updatedAt = new Date().toISOString();
       storage.saveConversation(conversation.conversationId, conversation);
+      return res.status(200).json({ status: 'ok', conversation });
+    }
 
-      return res.status(200).json({ status:'ok', conversation });
-    } else if (operation === 'edit' || operation === 'delete') {
-      // edit: target + newContent required. delete: target required.
+    // ---- EDIT / DELETE ----
+    if (operation === 'edit' || operation === 'delete') {
       if (!target) return res.status(400).json({ error: 'target required' });
       const idx = findMessageIndex(conversation.messages, target);
       if (idx === -1) return res.status(400).json({ error: 'target not found' });
       if (conversation.messages[idx].role !== 'user') return res.status(400).json({ error: 'target must be a user message' });
 
-      const originalMessages = conversation.messages.slice(); // keep original to know subsequent user messages
+      const original = conversation.messages.slice();
 
-      // find previous assistant before idx to get baseHistoryId
+      // найдем предыдущего assistant для получения базового historyId
       let prevAssistantIdx = -1;
       for (let i = idx - 1; i >= 0; i--) {
-        if (originalMessages[i].role === 'assistant') { prevAssistantIdx = i; break; }
+        if (original[i].role === 'assistant') { prevAssistantIdx = i; break; }
       }
-      const baseHistoryId = prevAssistantIdx !== -1 ? originalMessages[prevAssistantIdx].historyId || conversation.historyId : conversation.historyId;
+      const baseHistoryId = prevAssistantIdx !== -1 ? (original[prevAssistantIdx].turnId || conversation.historyId) : conversation.historyId;
 
-      // Build new baseConversation with messages up to idx (depending on delete/edit)
+      // перед модификацией попробуем удалить серверные assistant-turn'ы, которые идут после idx
+      // ищем первый assistant after idx
+      let firstAssistantAfter = -1;
+      for (let i = idx + 1; i < original.length; i++) {
+        if (original[i].role === 'assistant') { firstAssistantAfter = i; break; }
+      }
+      if (firstAssistantAfter !== -1) {
+        // delete assistant turns from firstAssistantAfter to end
+        await tryDeleteAssistantTurns(client, { messages: original }, firstAssistantAfter);
+      }
+
+      // build baseConversation: messages up to idx (include user if edit, exclude if delete)
       let baseConversation = {
         ...conversation,
-        messages: originalMessages.slice(0, idx + (operation === 'edit' ? 1 : 0)) // keep user if edit, remove it if delete
+        messages: original.slice(0, idx + (operation === 'edit' ? 1 : 0))
       };
 
       if (operation === 'edit') {
-        // update that user content
+        if (!newContent) return res.status(400).json({ error: 'newContent required for edit' });
         baseConversation.messages[baseConversation.messages.length -1].content = newContent;
         baseConversation.messages[baseConversation.messages.length -1].time = Date.now();
-      } else if (operation === 'delete') {
-        // remove the user message already handled by slice above
+      } else {
+        // delete: user removed (already sliced)
       }
 
-      // now, we need to append subsequent user messages from originalMessages after idx
-      // compute start index for subsequent messages:
-      const startIndex = idx + 1; // messages after target
-      // perform partial rebuild: send only user messages from originalMessages[startIndex .. end]
-      const rebuilt = await partialRebuild(client, characterId, baseConversation, originalMessages, startIndex, baseHistoryId);
+      // start index for subsequent user messages in original
+      const startIndex = idx + 1;
 
-      return res.status(200).json({ status:'ok', conversation: rebuilt });
-    } else {
-      return res.status(400).json({ error: 'unknown operation' });
+      // now partialRebuild from startIndex using baseHistoryId
+      const rebuilt = await partialRebuild(client, characterId, baseConversation, original, startIndex, baseHistoryId);
+
+      return res.status(200).json({ status: 'ok', conversation: rebuilt });
     }
+
+    return res.status(400).json({ error: 'unknown operation' });
   } catch (error) {
     console.error('Chat completion error:', error);
     return res.status(500).json({ error: { message: error.message || 'Internal server error', type:'internal_error', code:'server_error' } });
