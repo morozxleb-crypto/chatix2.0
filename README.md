@@ -168,8 +168,8 @@ Response:
 2. Log in to your account
 3. Open browser DevTools (F12)
 4. Go to Application/Storage → Cookies
-5. Find the cookie named `char_token`
-6. Copy its value
+5. Find the cookie named `user/`
+6. Copy token
 
 ### Character ID
 
