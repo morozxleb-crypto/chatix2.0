@@ -167,7 +167,7 @@ Response:
 1. Go to [Character.AI](https://character.ai)
 2. Log in to your account
 3. Open browser DevTools (F12)
-4. Go to Application/Storage → Cookies
+4. Go to Network
 5. Find the cookie named `user/`
 6. Copy token
 
@@ -178,7 +178,6 @@ Response:
    ```
    https://character.ai/chat/CHARACTER_ID_HERE
    ```
-3. Or open DevTools → Network tab, start a chat, and look for the `character_external_id` in API requests
 
 ## Testing
 
